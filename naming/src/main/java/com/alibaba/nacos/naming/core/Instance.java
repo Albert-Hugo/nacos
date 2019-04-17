@@ -297,11 +297,6 @@ public class Instance extends com.alibaba.nacos.api.naming.pojo.Instance impleme
 
     public boolean validate() {
 
-        Matcher matcher = IP_PATTERN.matcher(getIp() + ":" + getPort());
-        if (!matcher.matches()) {
-            return false;
-        }
-
         if (getWeight() > MAX_WEIGHT_VALUE || getWeight() < MIN_WEIGHT_VALUE) {
             return false;
         }
