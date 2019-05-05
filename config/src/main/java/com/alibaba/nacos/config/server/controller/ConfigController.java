@@ -18,12 +18,10 @@ package com.alibaba.nacos.config.server.controller;
 import com.alibaba.nacos.config.server.constant.Constants;
 import com.alibaba.nacos.config.server.exception.NacosException;
 import com.alibaba.nacos.config.server.model.*;
-import com.alibaba.nacos.config.server.service.AggrWhitelist;
-import com.alibaba.nacos.config.server.service.ConfigDataChangeEvent;
-import com.alibaba.nacos.config.server.service.ConfigSubService;
-import com.alibaba.nacos.config.server.service.PersistService;
-import com.alibaba.nacos.config.server.service.trace.ConfigTraceService;
-import com.alibaba.nacos.config.server.utils.*;
+import com.alibaba.nacos.config.server.service.*;
+import com.alibaba.nacos.config.server.utils.MD5Util;
+import com.alibaba.nacos.config.server.utils.ParamUtils;
+import com.alibaba.nacos.config.server.utils.RequestUtil;
 import com.alibaba.nacos.config.server.utils.event.EventDispatcher;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -40,11 +38,8 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.net.URLDecoder;
-import java.sql.Timestamp;
 import java.util.HashMap;
 import java.util.Map;
-
-import static com.alibaba.nacos.core.utils.SystemUtils.LOCAL_IP;
 
 /**
  * 软负载客户端发布数据专用控制器
@@ -63,12 +58,14 @@ public class ConfigController {
 
     private final transient ConfigSubService configSubService;
 
+    private final transient ConfigManagementService configManagementService;
+
     @Autowired
-    public ConfigController(ConfigServletInner configServletInner, PersistService persistService,
-                            ConfigSubService configSubService) {
-        this.inner = configServletInner;
+    public ConfigController(ConfigServletInner inner, PersistService persistService, ConfigSubService configSubService, ConfigManagementService configManagementService) {
+        this.inner = inner;
         this.persistService = persistService;
         this.configSubService = configSubService;
+        this.configManagementService = configManagementService;
     }
 
     /**
@@ -93,57 +90,32 @@ public class ConfigController {
                                  @RequestParam(value = "type", required = false) String type,
                                  @RequestParam(value = "schema", required = false) String schema)
         throws NacosException {
-        final String srcIp = RequestUtil.getRemoteIp(request);
-        String requestIpApp = RequestUtil.getAppName(request);
+
         ParamUtils.checkParam(dataId, group, "datumId", content);
         ParamUtils.checkParam(tag);
+        ConfigMetaData metaData = new ConfigMetaData();
+        metaData.setDataId(dataId);
+        metaData.setGroup(group);
+        metaData.setTenant(tenant);
+        metaData.setContent(content);
+        metaData.setTag(tag);
+        metaData.setAppName(appName);
+        metaData.setSrcUse(srcUser);
+        metaData.setConfigTags(configTags);
+        metaData.setDesc(desc);
+        metaData.setUse(use);
+        metaData.setEffect(effect);
+        metaData.setType(type);
+        metaData.setSchema(schema);
 
-        Map<String, Object> configAdvanceInfo = new HashMap<String, Object>(10);
-        if (configTags != null) {
-            configAdvanceInfo.put("config_tags", configTags);
-        }
-        if (desc != null) {
-            configAdvanceInfo.put("desc", desc);
-        }
-        if (use != null) {
-            configAdvanceInfo.put("use", use);
-        }
-        if (effect != null) {
-            configAdvanceInfo.put("effect", effect);
-        }
-        if (type != null) {
-            configAdvanceInfo.put("type", type);
-        }
-        if (schema != null) {
-            configAdvanceInfo.put("schema", schema);
-        }
-        ParamUtils.checkParam(configAdvanceInfo);
+        final String srcIp = RequestUtil.getRemoteIp(request);
+        String requestIpApp = RequestUtil.getAppName(request);
+        metaData.setRequestIpApp(requestIpApp);
+        metaData.setSrcIp(srcIp);
 
-        if (AggrWhitelist.isAggrDataId(dataId)) {
-            log.warn("[aggr-conflict] {} attemp to publish single data, {}, {}",
-                RequestUtil.getRemoteIp(request), dataId, group);
-            throw new NacosException(NacosException.NO_RIGHT, "dataId:" + dataId + " is aggr");
-        }
 
-        final Timestamp time = TimeUtils.getCurrentTime();
-        String betaIps = request.getHeader("betaIps");
-        ConfigInfo configInfo = new ConfigInfo(dataId, group, tenant, appName, content);
-        if (StringUtils.isBlank(betaIps)) {
-            if (StringUtils.isBlank(tag)) {
-                persistService.insertOrUpdate(srcIp, srcUser, configInfo, time, configAdvanceInfo, false);
-                EventDispatcher.fireEvent(new ConfigDataChangeEvent(false, dataId, group, tenant, time.getTime()));
-            } else {
-                persistService.insertOrUpdateTag(configInfo, tag, srcIp, srcUser, time, false);
-                EventDispatcher.fireEvent(new ConfigDataChangeEvent(false, dataId, group, tenant, tag, time.getTime()));
-            }
-        } else { // beta publish
-            persistService.insertOrUpdateBeta(configInfo, betaIps, srcIp, srcUser, time, false);
-            EventDispatcher.fireEvent(new ConfigDataChangeEvent(true, dataId, group, tenant, time.getTime()));
-        }
-        ConfigTraceService.logPersistenceEvent(dataId, group, tenant, requestIpApp, time.getTime(),
-            LOCAL_IP, ConfigTraceService.PERSISTENCE_EVENT_PUB, content);
+        return configManagementService.publishConfig(metaData);
 
-        return true;
     }
 
     /**
@@ -180,9 +152,8 @@ public class ConfigController {
                                           @RequestParam(value = "tenant", required = false,
                                               defaultValue = StringUtils.EMPTY) String tenant)
         throws NacosException {
-        // check params
-        ParamUtils.checkParam(dataId, group, "datumId", "content");
-        return persistService.findConfigAllInfo(dataId, group, tenant);
+
+        return configManagementService.configDetail(dataId, group, tenant);
     }
 
     /**
@@ -198,19 +169,8 @@ public class ConfigController {
                                 @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY)
                                     String tenant,
                                 @RequestParam(value = "tag", required = false) String tag) throws NacosException {
-        ParamUtils.checkParam(dataId, group, "datumId", "rm");
-        ParamUtils.checkParam(tag);
         String clientIp = RequestUtil.getRemoteIp(request);
-        if (StringUtils.isBlank(tag)) {
-            persistService.removeConfigInfo(dataId, group, tenant, clientIp, null);
-        } else {
-            persistService.removeConfigInfoTag(dataId, group, tenant, tag, clientIp, null);
-        }
-        final Timestamp time = TimeUtils.getCurrentTime();
-        ConfigTraceService.logPersistenceEvent(dataId, group, tenant, null, time.getTime(), clientIp,
-            ConfigTraceService.PERSISTENCE_EVENT_REMOVE, null);
-        EventDispatcher.fireEvent(new ConfigDataChangeEvent(false, dataId, group, tenant, tag, time.getTime()));
-        return true;
+        return configManagementService.deleteConfig(dataId, group, tenant, tag, clientIp);
     }
 
     @RequestMapping(value = "/catalog", method = RequestMethod.GET)
